@@ -4,72 +4,51 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # =========================================================================================
-#  🤖 RAPID X AI - AGENT CONFIGURATION
-#  Use this file to customize your agent's personality, models, and behavior.
+#  CONVODESK AI - AGENT CONFIGURATION
+#  Static fallback defaults — used when Spring Boot is unreachable or during local dev.
+#  Per-tenant values (prompt, voice, FAQs) override these at runtime via Spring Boot.
 # =========================================================================================
 
-# --- 1. AGENT PERSONA & PROMPTS ---
-# The main instructions for the AI. Defines who it is and how it behaves.
+# --- 1. FALLBACK PERSONA ---
 SYSTEM_PROMPT = """
-You are a helpful and polite School Receptionist at "Rapid X High School".
-
-**Your Goal:** Answer questions from parents about admissions, fees, and timings.
-
-**Key Behaviors:**
-1. **Multilingual:** You can speak fluent English and Hindi. If the user speaks Hindi, switch to Hindi immediately.
-2. **Polite & Warm:** Always be welcomed and respectful.
-3. **Be Concise:** Keep answers short (1-2 sentences). 
-4. **Admissions:** If asked about admissions, say they are open for Grade 1 to 10 and ask if they want to schedule a visit.
-5. **Fees:** If asked about fees, say "Please visit the school office for exact details, but it starts at roughly 50k per year."
-
-**CRITICAL:**
-- Only use `transfer_call` if they explicitly ask to talk to the Principal or Admin.
-- If they say "Bye", say "Namaste" or "Goodbye" and end the call.
+You are a helpful and polite AI receptionist.
+Answer questions concisely and professionally.
+If you don't know something, offer to transfer the caller to a human.
 """
 
-# The explicit first message the agent speaks when the user picks up.
-# This ensures the user knows who is calling immediately.
-INITIAL_GREETING = "The user has picked up the call. Introduce yourself as the School Receptionist immediately."
+INITIAL_GREETING = "The user has picked up the call. Greet them warmly and ask how you can help."
 
-# If the user initiates the call (inbound) or is already there:
-fallback_greeting = "Greet the user immediately."
-
-
-# --- 2. SPEECH-TO-TEXT (STT) SETTINGS ---
-# We use Deepgram for high-speed transcription.
+# --- 2. STT SETTINGS ---
 STT_PROVIDER = "deepgram"
-STT_MODEL = "nova-2"  # Recommended: "nova-2" (balanced) or "nova-3" (newest)
-STT_LANGUAGE = "en"   # "en" supports multi-language code switching in Nova 2
+STT_MODEL    = "nova-2"
+STT_LANGUAGE = "en"
 
+# # --- 3. TTS SETTINGS ---
+# DEFAULT_TTS_PROVIDER = "openai"
+# DEFAULT_TTS_VOICE    = "alloy"
 
-# --- 3. TEXT-TO-SPEECH (TTS) SETTINGS ---
-# Choose your voice provider: "openai", "sarvam" (Indian voices), or "cartesia" (Ultra-fast)
-DEFAULT_TTS_PROVIDER = "openai" 
-DEFAULT_TTS_VOICE = "alloy"      # OpenAI: alloy, echo, shimmer | Sarvam: anushka, aravind
+SARVAM_MODEL    = "bulbul:v2"
+SARVAM_LANGUAGE = "en-IN"
 
-# Sarvam AI Specifics (for Indian Context)
-SARVAM_MODEL = "bulbul:v2"
-SARVAM_LANGUAGE = "en-IN" # or hi-IN
-
-# Cartesia Specifics
 CARTESIA_MODEL = "sonic-2"
 CARTESIA_VOICE = "f786b574-daa5-4673-aa0c-cbe3e8534c02"
 
+# --- 4. LLM SETTINGS ---
+DEFAULT_LLM_PROVIDER = "groq"
+DEFAULT_LLM_MODEL    = "llama-3.3-70b-versatile"
 
-# --- 4. LARGE LANGUAGE MODEL (LLM) SETTINGS ---
-# Choose "openai" or "groq"
-DEFAULT_LLM_PROVIDER = "openai"
-DEFAULT_LLM_MODEL = "gpt-4o-mini" # OpenAI default
+DEFAULT_TTS_PROVIDER = "sarvam"
+DEFAULT_TTS_VOICE    = "anushka"
 
-# Groq Specifics (Faster inference)
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL       = "llama-3.3-70b-versatile"
 GROQ_TEMPERATURE = 0.7
 
+# --- 5. TELEPHONY ---
+DEFAULT_TRANSFER_NUMBER = os.getenv("DEFAULT_TRANSFER_NUMBER", "")
+SIP_TRUNK_ID            = os.getenv("LIVEKIT_SIP_TRUNK_ID", "")
+YOUR_VOBIZ_NUMBER       = os.getenv("YOUR_VOBIZ_NUMBER", "")
+SIP_DOMAIN              = os.getenv("VOBIZ_SIP_DOMAIN", "")
 
-# --- 5. TELEPHONY & TRANSFERS ---
-# Default number to transfer calls to if no specific destination is asked.
-DEFAULT_TRANSFER_NUMBER = os.getenv("DEFAULT_TRANSFER_NUMBER")
-
-# Vobiz Trunk Details (Loaded from .env usually, but you can hardcode if needed)
-SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_TRUNK_ID")
-SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN")
+# --- 6. SPRING BOOT BACKEND ---
+BACKEND_URL  = os.getenv("BACKEND_URL", "http://localhost:8080")
+AGENT_SECRET = os.getenv("AGENT_API_SECRET", "")
