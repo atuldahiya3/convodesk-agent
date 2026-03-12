@@ -21,7 +21,7 @@ INITIAL_GREETING = "The user has picked up the call. Greet them warmly and ask h
 # --- 2. STT SETTINGS ---
 STT_PROVIDER = "deepgram"
 STT_MODEL    = "nova-2"
-STT_LANGUAGE = "en"
+STT_LANGUAGE = "en"        # was "hi-en" which is not a valid Deepgram code
 
 # # --- 3. TTS SETTINGS ---
 # DEFAULT_TTS_PROVIDER = "openai"

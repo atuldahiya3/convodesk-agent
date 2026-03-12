@@ -1,189 +1,288 @@
 import os
 import certifi
 import logging
-import json
 import asyncio
 import httpx
-from typing import Annotated, Optional
+from typing import Annotated
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
-# Fix for macOS SSL Certificate errors
 os.environ['SSL_CERT_FILE'] = certifi.where()
 
 from livekit import agents, api, rtc
-from livekit.agents import AgentSession, Agent, RoomInputOptions, JobContext
-from livekit.plugins import (
-    openai,
-    cartesia,
-    deepgram,
-    noise_cancellation,
-    silero,
-    sarvam,
-)
+from livekit.agents import AgentSession, Agent, JobContext
+from livekit.plugins import openai, cartesia, deepgram, noise_cancellation, silero, sarvam
 from livekit.agents import llm
 
-# Load environment variables
 load_dotenv(".env")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("telephony-agent")
+# =============================================================================
+#  LOGGING — structured with prefix for easy filtering
+# =============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+)
+logger = logging.getLogger("convodesk-agent")
 
 import config
 
+
 # =============================================================================
-#  SPRING BOOT CLIENT
+#  HTTP CLIENT HELPER
+#  Single place for all backend calls — logs every request + response
+# =============================================================================
+
+async def _call_backend(
+    method: str,
+    path: str,
+    params: dict = None,
+    json: dict = None,
+    timeout: float = 8.0,
+) -> dict:
+    """
+    Makes authenticated request to Spring Boot backend.
+    Logs full request and response for debugging.
+    Returns parsed JSON or {} on failure.
+    """
+    url = f"{config.BACKEND_URL}{path}"
+    headers = {"X-Agent-Secret": config.AGENT_SECRET}
+
+    logger.info(f"▶ {method} {url}")
+    if params: logger.info(f"  params: {params}")
+    if json:   logger.info(f"  body:   {json}")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.request(
+                method, url,
+                params=params,
+                json=json,
+                headers=headers,
+                timeout=timeout,
+            )
+            logger.info(f"◀ {method} {url} → HTTP {r.status_code}")
+
+            if r.status_code >= 400:
+                logger.error(f"  ERROR response body: {r.text}")
+                return {"error": r.text, "status": r.status_code}
+
+            data = r.json()
+            logger.info(f"  response: {data}")
+            return data
+
+    except httpx.TimeoutException:
+        logger.error(f"  TIMEOUT: {method} {url} exceeded {timeout}s")
+        return {"error": "timeout"}
+    except Exception as e:
+        logger.error(f"  FAILED: {method} {url} — {e}")
+        return {"error": str(e)}
+
+
+# =============================================================================
+#  SPRING BOOT API CALLS — one function per endpoint
 # =============================================================================
 
 async def fetch_tenant_config(called_number: str, customer_phone: str) -> dict:
     """
-    Fetches per-tenant config from Spring Boot.
-    called_number  = sip.trunkPhoneNumber = your Vobiz DID = identifies the business
-    customer_phone = sip.phoneNumber      = the caller
-
-    Returns {} on any failure — agent then falls back to static config.py values.
+    GET /telephony/context
+    Returns full business config + system prompt + FAQs + callLogId
     """
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{config.BACKEND_URL}/telephony/context",
-                params={"calledNumber": called_number, "customerPhone": customer_phone},
-                headers={"X-Agent-Secret": config.AGENT_SECRET},
-                timeout=8.0,
-            )
-            r.raise_for_status()
-            data = r.json()
-            logger.info(f"Tenant config loaded — business: {data.get('businessName')}, callLogId: {data.get('callLogId')}")
-            return data
-    except Exception as e:
-        logger.error(f"Could not fetch tenant config: {e}. Falling back to config.py defaults.")
+    logger.info(f"[CONFIG] Fetching tenant config — called: {called_number}, caller: {customer_phone}")
+    data = await _call_backend(
+        "GET", "/telephony/context",
+        params={"calledNumber": called_number, "customerPhone": customer_phone},
+    )
+    if data.get("error"):
+        logger.error(f"[CONFIG] Failed to load tenant config: {data}")
         return {}
+
+    logger.info(
+        f"[CONFIG] Loaded — business: '{data.get('businessName')}' (id={data.get('businessId')}), "
+        f"callLogId: {data.get('callLogId')}, "
+        f"bookingEnabled: {data.get('bookingEnabled')}, "
+        f"faqs: {len(data.get('faqs', []))} entries"
+    )
+    return data
 
 
 async def post_segment(call_log_id: int, speaker: str, text: str):
+    """
+    POST /telephony/calls/{id}/segment
+    Streams transcript segments to backend in real time
+    """
+    if not call_log_id or not text.strip():
+        return
+    logger.debug(f"[SEGMENT] call={call_log_id} [{speaker}]: {text[:60]}...")
+    await _call_backend(
+        "POST", f"/telephony/calls/{call_log_id}/segment",
+        json={"sender": speaker, "text": text},
+        timeout=5.0,
+    )
+
+
+async def save_summary(call_log_id: int, summary: str, full_transcript: str):
+    """
+    PATCH /telephony/calls/{id}/summary
+    Saves AI-generated summary + full transcript after call ends
+    """
     if not call_log_id:
         return
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{config.BACKEND_URL}/calls/segment",
-                json={"callId": call_log_id, "sender": speaker, "text": text},
-                headers={"X-Agent-Secret": config.AGENT_SECRET},
-                timeout=5.0,
-            )
-    except Exception as e:
-        logger.warning(f"Segment post failed: {e}")
+    logger.info(f"[SUMMARY] Saving summary for call {call_log_id} — {len(full_transcript)} chars transcript")
+    result = await _call_backend(
+        "PATCH", f"/telephony/calls/{call_log_id}/summary",
+        json={"summary": summary, "fullTranscript": full_transcript},
+        timeout=10.0,
+    )
+    if result.get("error"):
+        logger.error(f"[SUMMARY] Failed to save summary: {result}")
+    else:
+        logger.info(f"[SUMMARY] Saved successfully for call {call_log_id}")
 
 
 async def end_call(call_log_id: int):
+    """
+    POST /telephony/calls/{id}/end
+    Marks call as COMPLETED in DB with final duration
+    """
     if not call_log_id:
         return
+    logger.info(f"[END_CALL] Ending call {call_log_id}")
+    result = await _call_backend(
+        "POST", f"/telephony/calls/{call_log_id}/end",
+        timeout=5.0,
+    )
+    if result.get("error"):
+        logger.error(f"[END_CALL] Failed: {result}")
+    else:
+        logger.info(f"[END_CALL] Call {call_log_id} marked COMPLETED")
+
+
+async def generate_summary_via_groq(transcript_text: str) -> str:
+    """
+    Direct Groq API call to generate 2-3 sentence call summary.
+    Not routed through Spring Boot.
+    """
+    if not transcript_text.strip():
+        return ""
+
+    logger.info(f"[SUMMARY_GEN] Generating summary for {len(transcript_text)} char transcript")
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{config.BACKEND_URL}/business/calls/{call_log_id}/end",
-                headers={"X-Agent-Secret": config.AGENT_SECRET},
-                timeout=5.0,
+            r = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Summarize this call transcript in 2-3 sentences. "
+                                "Include: the caller's main query, what was resolved, "
+                                "and any action taken (appointment booked, transferred, etc.). "
+                                "Be concise and factual."
+                            )
+                        },
+                        {"role": "user", "content": transcript_text}
+                    ],
+                    "max_tokens": 200,
+                },
+                timeout=15.0,
             )
-        logger.info(f"Call {call_log_id} marked as ended.")
+            summary = r.json()["choices"][0]["message"]["content"]
+            logger.info(f"[SUMMARY_GEN] Generated: {summary}")
+            return summary
     except Exception as e:
-        logger.warning(f"end_call failed: {e}")
+        logger.error(f"[SUMMARY_GEN] Failed: {e}")
+        return ""
 
 
 # =============================================================================
-#  PROVIDER BUILDERS — same as your original working version
+#  PROVIDER BUILDERS
 # =============================================================================
 
-def _build_tts(config_provider: str = None, config_voice: str = None):
+SARVAM_VOICES = {"anushka", "manisha", "vidya", "arya", "abhilash", "karun", "hitesh"}
+
+
+def _build_tts(config_provider: str = None, config_voice: str = None, stt_language: str = None):
     provider = (config_provider or os.getenv("TTS_PROVIDER", config.DEFAULT_TTS_PROVIDER)).lower()
 
-    # Force Sarvam for specific Indian voices
-    if config_voice in ["anushka", "aravind", "amartya", "dhruv"]:
+    # If voice is a known Sarvam voice, force Sarvam regardless of provider field
+    if config_voice in SARVAM_VOICES:
         provider = "sarvam"
 
+    if provider == "sarvam":
+        voice = config_voice if config_voice in SARVAM_VOICES else "anushka"
+        lang_code = "hi-IN" if stt_language in ["hi", "multi"] else os.getenv("SARVAM_LANGUAGE", "en-IN")
+        logger.info(f"[TTS] Sarvam — voice: {voice}, lang: {lang_code}")
+        return sarvam.TTS(
+            model=config.SARVAM_MODEL,
+            speaker=voice,
+            target_language_code=lang_code,
+        )
+
     if provider == "cartesia":
+        logger.info(f"[TTS] Cartesia — model: {config.CARTESIA_MODEL}")
         return cartesia.TTS(model=config.CARTESIA_MODEL, voice=config.CARTESIA_VOICE)
 
-    if provider == "sarvam":
-        voice = config_voice or os.getenv("SARVAM_VOICE", "anushka")
-        return sarvam.TTS(model=config.SARVAM_MODEL, speaker=voice, target_language_code=config.SARVAM_LANGUAGE)
+    if provider == "deepgram":
+        voice = config_voice or "aura-asteria-en"
+        logger.info(f"[TTS] Deepgram Aura — voice: {voice}")
+        return deepgram.TTS(model=voice)
 
-    # Default to OpenAI
+    # OpenAI fallback
     voice = config_voice or os.getenv("OPENAI_TTS_VOICE", config.DEFAULT_TTS_VOICE)
+    logger.info(f"[TTS] OpenAI — voice: {voice}")
     return openai.TTS(model="tts-1", voice=voice)
 
 
 def _build_llm(config_provider: str = None, config_model: str = None):
     provider = (config_provider or os.getenv("LLM_PROVIDER", config.DEFAULT_LLM_PROVIDER)).lower()
     if provider == "groq":
+        model = config_model or os.getenv("GROQ_MODEL", config.GROQ_MODEL)
+        logger.info(f"[LLM] Groq — model: {model}")
         return openai.LLM(
             base_url="https://api.groq.com/openai/v1",
             api_key=os.getenv("GROQ_API_KEY"),
-            model=config_model or os.getenv("GROQ_MODEL", config.GROQ_MODEL),
+            model=model,
         )
-    return openai.LLM(
-        model=config_model or config.DEFAULT_LLM_MODEL,
-        api_key=os.getenv("OPENAI_API_KEY"),
+    model = config_model or config.DEFAULT_LLM_MODEL
+    logger.info(f"[LLM] OpenAI — model: {model}")
+    return openai.LLM(model=model, api_key=os.getenv("OPENAI_API_KEY"))
+
+
+def _build_stt(stt_language: str = None):
+    language = stt_language or os.getenv("DEEPGRAM_LANGUAGE", config.STT_LANGUAGE)
+    logger.info(f"[STT] Deepgram whisper-large — language: {language}")
+    return deepgram.STT(
+        model="nova-3",   # whisper-large handles Hindi + Indian accents best
+        language=language,
+        smart_format=True,
     )
-# =============================================================================
-#  TOOLS — same as your original working version
-# =============================================================================
-
-class AssistantTools(llm.ToolContext):
-    def __init__(self, ctx: JobContext, phone: str = None, transfer_number: str = None):
-        super().__init__(tools=[])
-        self.ctx = ctx
-        self.phone = phone
-        self.transfer_number = transfer_number or config.DEFAULT_TRANSFER_NUMBER
-
-    @llm.function_tool(description="Transfer the call to a human support agent.")
-    async def transfer_call(
-        self,
-        reason: Annotated[
-            str,
-            llm.TypeInfo(description="The reason why the caller needs to be transferred")
-        ] = "User requested transfer"
-    ):
-        logger.info(f"Transfer requested. Reason: {reason}")
-
-        participant_identity = None
-        for p in self.ctx.room.remote_participants.values():
-            if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-                participant_identity = p.identity
-                break
-
-        if not participant_identity:
-            return "I'm sorry, I couldn't identify your call line to perform the transfer."
-
-        try:
-            await self.ctx.api.sip.transfer_sip_participant(
-                api.TransferSIPParticipantRequest(
-                    room_name=self.ctx.room.name,
-                    participant_identity=participant_identity,
-                    transfer_to=self.transfer_number,
-                    play_dialtone=True
-                )
-            )
-            return "One moment please, I am transferring your call to a human representative."
-        except Exception as e:
-            logger.error(f"Transfer failed: {e}")
-            return "I encountered an error while trying to transfer your call. Please stay on the line."
 
 
 # =============================================================================
-#  SEGMENT STREAMER — buffers transcript, flushes to Spring Boot every 5s
+#  SEGMENT STREAMER
 # =============================================================================
 
 class SegmentStreamer:
     def __init__(self, call_log_id: int):
         self.call_log_id = call_log_id
         self._buffer: list = []
+        self._all: list = []
         self._lock = asyncio.Lock()
         self._task = asyncio.create_task(self._flush_loop())
+        logger.info(f"[STREAMER] Started for call {call_log_id}")
 
     async def push(self, speaker: str, text: str):
+        if not text.strip():
+            return
         async with self._lock:
-            self._buffer.append({"speaker": speaker, "text": text})
+            entry = {"speaker": speaker, "text": text}
+            self._buffer.append(entry)
+            self._all.append(entry)
+        logger.info(f"[TRANSCRIPT] [{speaker.upper()}]: {text}")
 
     async def _flush_loop(self):
         while True:
@@ -196,12 +295,247 @@ class SegmentStreamer:
                 return
             batch = self._buffer[:]
             self._buffer.clear()
+
+        logger.info(f"[STREAMER] Flushing {len(batch)} segments to backend")
         for seg in batch:
             await post_segment(self.call_log_id, seg["speaker"], seg["text"])
 
+    def get_full_transcript(self) -> str:
+        return "\n".join([
+            f"{s['speaker'].upper()}: {s['text']}"
+            for s in self._all
+        ])
+
     async def close(self):
         self._task.cancel()
-        await self._do_flush()  # final flush on call end
+        await self._do_flush()
+        logger.info(f"[STREAMER] Closed — total segments: {len(self._all)}")
+
+
+# =============================================================================
+#  TOOLS
+# =============================================================================
+
+class AssistantTools(llm.ToolContext):
+    def __init__(self, ctx: JobContext, caller_phone: str,
+                 transfer_number: str, call_log_id: int,
+                 business_id: int, booking_enabled: bool):
+        super().__init__(tools=[])
+        self.ctx             = ctx
+        self.caller_phone    = caller_phone
+        self.transfer_number = transfer_number or config.DEFAULT_TRANSFER_NUMBER
+        self.call_log_id     = call_log_id
+        self.business_id     = business_id
+        self.booking_enabled = booking_enabled
+
+        logger.info(
+            f"[TOOLS] Initialized — businessId: {business_id}, "
+            f"callLogId: {call_log_id}, bookingEnabled: {booking_enabled}, "
+            f"callerPhone: {caller_phone}, transferNumber: {transfer_number}"
+        )
+
+    # ------------------------------------------------------------------
+    #  TRANSFER CALL
+    # ------------------------------------------------------------------
+    @llm.function_tool(description="Transfer the call to a human staff member or receptionist.")
+    async def transfer_call(
+        self,
+        reason: Annotated[str, llm.TypeInfo(
+            description="Reason the caller needs to be transferred"
+        )] = "User requested transfer",
+    ):
+        logger.info(f"[TOOL:transfer_call] reason='{reason}', target={self.transfer_number}")
+
+        participant_identity = None
+        for p in self.ctx.room.remote_participants.values():
+            if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
+                participant_identity = p.identity
+                break
+
+        logger.info(f"[TOOL:transfer_call] SIP participant identity: {participant_identity}")
+
+        if not participant_identity:
+            return "I'm sorry, I couldn't identify your call line."
+        if not self.transfer_number:
+            return "I'm sorry, no transfer number is configured for this business."
+
+        try:
+            await self.ctx.api.sip.transfer_sip_participant(
+                api.TransferSIPParticipantRequest(
+                    room_name=self.ctx.room.name,
+                    participant_identity=participant_identity,
+                    transfer_to=self.transfer_number,
+                    play_dialtone=True,
+                )
+            )
+            logger.info(f"[TOOL:transfer_call] Transfer initiated to {self.transfer_number}")
+            return "One moment please, transferring you to our team now."
+        except Exception as e:
+            logger.error(f"[TOOL:transfer_call] Transfer failed: {e}")
+            return "I encountered an error during transfer. Please stay on the line."
+
+    # ------------------------------------------------------------------
+    #  GET STAFF
+    # ------------------------------------------------------------------
+    @llm.function_tool(description=(
+        "Get the list of available staff or service providers for this business. "
+        "Call this at the START of any booking conversation before asking for a date."
+    ))
+    async def get_staff(
+        self,
+        _dummy: Annotated[str, llm.TypeInfo(
+            description="Pass empty string."
+        )] = "",
+    ):
+        logger.info(f"[TOOL:get_staff] businessId={self.business_id}, bookingEnabled={self.booking_enabled}")
+
+        if not self.booking_enabled:
+            logger.info("[TOOL:get_staff] Booking not enabled, skipping")
+            return "Booking is not enabled for this business."
+
+        data = await _call_backend(
+            "GET", "/calendar/staff",
+            params={"businessId": self.business_id},
+        )
+
+        if data.get("error"):
+            logger.error(f"[TOOL:get_staff] Backend error: {data}")
+            return "Any available staff member."
+
+        staff = data.get("staff", [])
+        logger.info(f"[TOOL:get_staff] Got staff list: {staff}")
+
+        if not staff:
+            return "Any available staff member."
+        if len(staff) == 1:
+            return f"Available: {staff[0]}."
+        return "Available staff: " + ", ".join(staff[:-1]) + " and " + staff[-1] + "."
+
+    # ------------------------------------------------------------------
+    #  CHECK AVAILABILITY
+    # ------------------------------------------------------------------
+    @llm.function_tool(description=(
+        "Check available appointment slots for a given date. "
+        "Always call this before booking to confirm the slot is actually free."
+    ))
+    async def check_availability(
+        self,
+        date: Annotated[str, llm.TypeInfo(
+            description="Date in YYYY-MM-DD format. Convert 'tomorrow' or 'next Monday' to this format."
+        )],
+        staff_name: Annotated[str, llm.TypeInfo(
+            description="Staff member name, or 'Any' if caller has no preference."
+        )] = "Any",
+    ):
+        logger.info(f"[TOOL:check_availability] businessId={self.business_id}, date={date}, staff={staff_name}")
+
+        if not self.booking_enabled:
+            return "Online booking is not available. Please call during working hours."
+
+        data = await _call_backend(
+            "GET", "/calendar/slots",
+            params={
+                "businessId": self.business_id,
+                "staffName":  staff_name,
+                "date":       date,
+            },
+        )
+
+        if data.get("error"):
+            logger.error(f"[TOOL:check_availability] Backend error: {data}")
+            return "I couldn't check availability right now. Please try again."
+
+        slots = data.get("slots", [])
+        logger.info(f"[TOOL:check_availability] Got {len(slots)} slots for {date}: {slots}")
+
+        if not slots:
+            tomorrow = (datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+            return (f"No slots available on {date}. "
+                    f"Would you like me to check {tomorrow} or another date?")
+
+        shown = slots[:4]
+        more  = f" and {len(slots) - 4} more available" if len(slots) > 4 else ""
+        return f"Available on {date}: {', '.join(shown)}{more}. Which time works for you?"
+
+    # ------------------------------------------------------------------
+    #  BOOK APPOINTMENT
+    # ------------------------------------------------------------------
+    @llm.function_tool(description=(
+        "Book an appointment after the caller has confirmed their name, date, time, and staff. "
+        "Do NOT call this without first calling check_availability. "
+        "Do NOT guess the customer name — always ask."
+    ))
+    async def book_appointment(
+        self,
+        customer_name: Annotated[str, llm.TypeInfo(
+            description="Full name of the customer. Always ask if not provided."
+        )],
+        preferred_date: Annotated[str, llm.TypeInfo(
+            description="Date in YYYY-MM-DD format."
+        )],
+        preferred_time: Annotated[str, llm.TypeInfo(
+            description="Time in h:mm AM/PM format e.g. '10:30 AM'. Must be from available slots."
+        )],
+        staff_name: Annotated[str, llm.TypeInfo(
+            description="Staff member name or 'Any' if no preference."
+        )] = "Any",
+        customer_email: Annotated[str, llm.TypeInfo(
+            description="Customer email if provided. Leave blank if not given."
+        )] = "",
+    ):
+        logger.info(
+            f"[TOOL:book_appointment] businessId={self.business_id}, "
+            f"customer='{customer_name}', phone={self.caller_phone}, "
+            f"date={preferred_date}, time={preferred_time}, staff={staff_name}"
+        )
+
+        if not self.booking_enabled:
+            return "Online booking is not available. Please call during working hours."
+
+        payload = {
+            "businessId":    self.business_id,
+            "callLogId":     self.call_log_id,
+            "customerName":  customer_name,
+            "customerPhone": self.caller_phone,
+            "customerEmail": customer_email,
+            "staffName":     staff_name,
+            "preferredDate": preferred_date,
+            "preferredTime": preferred_time,
+        }
+
+        result = await _call_backend(
+            "POST", "/calendar/book",
+            json=payload,
+            timeout=12.0,
+        )
+
+        logger.info(f"[TOOL:book_appointment] Result: {result}")
+
+        if result.get("error"):
+            logger.error(f"[TOOL:book_appointment] Backend error: {result}")
+            return "I wasn't able to complete the booking right now. Let me transfer you to our team."
+
+        if result.get("success"):
+            logger.info(
+                f"[TOOL:book_appointment] ✅ Booked — "
+                f"appointmentId={result.get('appointmentId')}, "
+                f"date={result.get('date')}, time={result.get('time')}, "
+                f"staff={result.get('staffName')}, provider={result.get('provider')}"
+            )
+            return (
+                f"Done! Appointment confirmed — "
+                f"{result['date']} at {result['time']} "
+                f"with {result['staffName']} at {result['businessName']}. "
+                f"You'll receive a WhatsApp confirmation shortly."
+            )
+        else:
+            # Spring Boot returns specific helpful messages for all edge cases:
+            # - "Slot already booked. Next available is 3 PM"
+            # - "We are closed on Sundays"
+            # - "Outside working hours"
+            msg = result.get("message", "I couldn't complete the booking. Please try another time.")
+            logger.warning(f"[TOOL:book_appointment] Booking rejected: {msg}")
+            return msg
 
 
 # =============================================================================
@@ -209,63 +543,84 @@ class SegmentStreamer:
 # =============================================================================
 
 async def entrypoint(ctx: JobContext):
-    logger.info(f"--- New Job Received in room: {ctx.room.name} ---")
-
-    # 1. Connect immediately to acknowledge the job
+    logger.info(f"[ENTRYPOINT] New job — room: {ctx.room.name}")
     await ctx.connect()
 
-    # 2. Wait for the SIP participant (the Vobiz caller)
+    # 1. Wait for SIP participant
     participant = await ctx.wait_for_participant()
+    logger.info(f"[ENTRYPOINT] Participant joined — kind: {participant.kind}, identity: {participant.identity}")
 
     caller_number = None
     called_number = None
 
     if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
-        # LiveKit sets these automatically from the SIP INVITE headers
-        caller_number = participant.attributes.get("sip.phoneNumber")       # +919996978591
-        called_number = participant.attributes.get("sip.trunkPhoneNumber")  # +918049280412
-        logger.info(f"INBOUND SIP — caller: {caller_number}, called: {called_number}")
+        caller_number = participant.attributes.get("sip.phoneNumber")
+        called_number = participant.attributes.get("sip.trunkPhoneNumber")
+        logger.info(f"[ENTRYPOINT] INBOUND SIP — caller: {caller_number}, called: {called_number}")
+        logger.info(f"[ENTRYPOINT] All SIP attributes: {dict(participant.attributes)}")
+    else:
+        logger.warning(f"[ENTRYPOINT] Non-SIP participant: kind={participant.kind}")
 
-    # 3. Fetch per-tenant config from Spring Boot
-    #    On any failure this returns {} and everything below falls back to config.py
+    # 2. Fetch per-tenant config
     tenant = {}
     if called_number and caller_number:
         tenant = await fetch_tenant_config(called_number, caller_number)
+    else:
+        logger.warning("[ENTRYPOINT] Missing caller/called number — using default config")
 
-    # 4. Extract values — tenant config wins, config.py is the fallback
-    call_log_id  = tenant.get("callLogId")
-    system_prompt = tenant.get("systemPrompt") or config.SYSTEM_PROMPT
-    greeting     = tenant.get("greeting")      or config.INITIAL_GREETING
-    tts_provider = tenant.get("ttsProvider")   or None
-    tts_voice    = tenant.get("ttsVoice")      or None
-    llm_provider = tenant.get("llmProvider") or None
-    llm_model    = tenant.get("llmModel")    or None
-    transfer_num = tenant.get("transferNumber") or config.DEFAULT_TRANSFER_NUMBER
-    faqs         = tenant.get("faqs", [])
+    # 3. Extract config with fallbacks
+    call_log_id     = tenant.get("callLogId")
+    business_id     = tenant.get("businessId")
+    business_name   = tenant.get("businessName", "our business")
+    system_prompt   = tenant.get("systemPrompt") or config.SYSTEM_PROMPT
+    greeting        = tenant.get("greeting")     or config.INITIAL_GREETING
+    tts_provider    = tenant.get("ttsProvider")
+    tts_voice       = tenant.get("ttsVoice")
+    llm_provider    = tenant.get("llmProvider")
+    llm_model       = tenant.get("llmModel")
+    stt_language    = tenant.get("sttLanguage")
+    transfer_num    = tenant.get("transferNumber") or config.DEFAULT_TRANSFER_NUMBER
+    booking_enabled = tenant.get("bookingEnabled", False)
+    faqs            = tenant.get("faqs", [])
 
-    # 5. Inject FAQs into the system prompt
+    logger.info(
+        f"[ENTRYPOINT] Session config — "
+        f"business: '{business_name}' (id={business_id}), "
+        f"callLogId: {call_log_id}, "
+        f"llm: {llm_provider}/{llm_model}, "
+        f"tts: {tts_provider}/{tts_voice}, "
+        f"stt: {stt_language}, "
+        f"booking: {booking_enabled}, "
+        f"faqs: {len(faqs)}, "
+        f"transfer: {transfer_num}"
+    )
+
+    # 4. Inject FAQs into system prompt
     if faqs:
         faq_lines = "\n".join([
             f"Q: {f.get('question', '')}\nA: {f.get('answer', '')}"
             for f in faqs
         ])
-        system_prompt += f"\n\n## Knowledge Base\nUse the following to answer caller questions:\n\n{faq_lines}"
+        system_prompt += f"\n\n## Knowledge Base\n{faq_lines}"
+        logger.info(f"[ENTRYPOINT] Injected {len(faqs)} FAQs into system prompt")
 
-    logger.info(f"Starting session — business: '{tenant.get('businessName', 'default')}', "
-                f"call_log_id: {call_log_id}, llm: {llm_provider or 'default'}, tts_voice: {tts_voice or 'default'}")
-
-    # 6. Initialize tools and session — same pattern as your original
-    fnc_ctx  = AssistantTools(ctx, caller_number, transfer_num)
+    # 5. Build tools + streamer + session
+    tools_ctx = AssistantTools(
+        ctx, caller_number, transfer_num,
+        call_log_id, business_id, booking_enabled
+    )
     streamer = SegmentStreamer(call_log_id) if call_log_id else None
+    if not streamer:
+        logger.warning("[ENTRYPOINT] No callLogId — transcript streaming disabled")
 
     session = AgentSession(
         vad=silero.VAD.load(),
-        stt=deepgram.STT(model=config.STT_MODEL, language=config.STT_LANGUAGE),
+        stt=_build_stt(stt_language),
         llm=_build_llm(llm_provider, llm_model),
-        tts=_build_tts(tts_provider, tts_voice),
+        tts=_build_tts(tts_provider, tts_voice, stt_language),
     )
 
-    # 7. Wire transcript segments to Spring Boot (only if call_log_id was returned)
+    # 6. Wire transcript streaming
     if streamer:
         @session.on("user_speech_committed")
         def on_user_speech(event):
@@ -275,34 +630,55 @@ async def entrypoint(ctx: JobContext):
         def on_agent_speech(event):
             asyncio.create_task(streamer.push("agent", event.transcript))
 
-    # 8. Start the agent — fix deprecated RoomInputOptions → RoomOptions
+        logger.info("[ENTRYPOINT] Transcript streaming wired")
+
+    # 7. Start agent
+    logger.info("[ENTRYPOINT] Starting agent session")
     await session.start(
         room=ctx.room,
         agent=Agent(
             instructions=system_prompt,
-            tools=list(fnc_ctx.function_tools.values())
+            tools=list(tools_ctx.function_tools.values()),
         ),
-        room_input_options=RoomInputOptions(
+        room_input_options=agents.RoomInputOptions(
             noise_cancellation=noise_cancellation.BVCTelephony(),
-            close_on_disconnect=True,
         ),
     )
+    logger.info(f"[ENTRYPOINT] Agent started with {len(tools_ctx.function_tools)} tools: "
+                f"{list(tools_ctx.function_tools.keys())}")
 
-    # 9. Greet the caller
+    # 8. Greet the caller
+    logger.info(f"[ENTRYPOINT] Generating greeting: {greeting[:80]}...")
     await session.generate_reply(instructions=greeting)
 
-    # 10. Wait for room to close, THEN clean up
-    #     ctx.room.on("disconnected") fires when the SIP caller hangs up
+    # 9. Wait for disconnect
+    logger.info("[ENTRYPOINT] Waiting for disconnect...")
     disconnected = asyncio.Event()
     ctx.room.on("disconnected", lambda *_: disconnected.set())
     await disconnected.wait()
+    logger.info("[ENTRYPOINT] Room disconnected")
 
-    # 11. Cleanup after call ends
+    # 10. Flush remaining transcript
     if streamer:
+        logger.info("[ENTRYPOINT] Closing streamer and flushing remaining segments")
         await streamer.close()
+
+    # 11. Generate + save summary
+    if call_log_id and streamer:
+        transcript_text = streamer.get_full_transcript()
+        logger.info(f"[ENTRYPOINT] Full transcript ({len(transcript_text)} chars):\n{transcript_text}")
+        if transcript_text.strip():
+            summary = await generate_summary_via_groq(transcript_text)
+            await save_summary(call_log_id, summary, transcript_text)
+        else:
+            logger.warning("[ENTRYPOINT] Empty transcript — skipping summary")
+
+    # 12. Mark call ended
     if call_log_id:
         await end_call(call_log_id)
-    logger.info(f"Call ended — room: {ctx.room.name}")
+
+    logger.info(f"[ENTRYPOINT] ✅ Call completed — room: {ctx.room.name}, callLogId: {call_log_id}")
+
 
 if __name__ == "__main__":
     agents.cli.run_app(
