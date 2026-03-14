@@ -29,7 +29,6 @@ import config
 
 # =============================================================================
 #  HTTP CLIENT HELPER — HIGH TIMEOUTS + NETWORK RESILIENCE
-#  Prevents broken-pipe / timeout issues when backend or telephony is slow
 # =============================================================================
 
 async def _call_backend(
@@ -37,12 +36,12 @@ async def _call_backend(
     path: str,
     params: dict = None,
     json: dict = None,
-    timeout: float = 45.0,          # DEFAULT NOW 45s (was 8s) — fixes most broken pipes
+    timeout: float = 45.0,
 ) -> dict:
     """
     Makes authenticated request to Spring Boot backend.
     - High default timeout to survive slow telephony/DB/calendar ops
-    - Catches network issues gracefully (no more unhandled exceptions)
+    - Catches network issues gracefully
     - Logs full request/response for debugging
     """
     url = f"{config.BACKEND_URL}{path}"
@@ -82,7 +81,7 @@ async def _call_backend(
 
 
 # =============================================================================
-#  SPRING BOOT API CALLS — one function per endpoint
+#  SPRING BOOT API CALLS
 # =============================================================================
 
 async def fetch_tenant_config(called_number: str, customer_phone: str) -> dict:
@@ -90,7 +89,7 @@ async def fetch_tenant_config(called_number: str, customer_phone: str) -> dict:
     data = await _call_backend(
         "GET", "/telephony/context",
         params={"calledNumber": called_number, "customerPhone": customer_phone},
-        timeout=15.0,                     # increased
+        timeout=15.0,
     )
     if data.get("error"):
         logger.error(f"[CONFIG] Failed to load tenant config: {data}")
@@ -106,13 +105,14 @@ async def fetch_tenant_config(called_number: str, customer_phone: str) -> dict:
 
 
 async def post_segment(call_log_id: int, speaker: str, text: str):
+    """POST /telephony/calls/{id}/segment — correct path matching TelephonyContextController"""
     if not call_log_id or not text.strip():
         return
     logger.debug(f"[SEGMENT] call={call_log_id} [{speaker}]: {text[:60]}...")
     await _call_backend(
         "POST", f"/telephony/calls/{call_log_id}/segment",
         json={"sender": speaker, "text": text},
-        timeout=8.0,                      # increased from 5s
+        timeout=8.0,
     )
 
 
@@ -123,7 +123,7 @@ async def save_summary(call_log_id: int, summary: str, full_transcript: str):
     result = await _call_backend(
         "PATCH", f"/telephony/calls/{call_log_id}/summary",
         json={"summary": summary, "fullTranscript": full_transcript},
-        timeout=30.0,                     # increased (long transcript)
+        timeout=30.0,
     )
     if result.get("error"):
         logger.error(f"[SUMMARY] Failed to save summary: {result}")
@@ -132,17 +132,21 @@ async def save_summary(call_log_id: int, summary: str, full_transcript: str):
 
 
 async def end_call(call_log_id: int):
+    """POST /telephony/calls/{id}/end — agent-accessible endpoint on TelephonyContextController"""
     if not call_log_id:
         return
     logger.info(f"[END_CALL] Ending call {call_log_id}")
     result = await _call_backend(
         "POST", f"/telephony/calls/{call_log_id}/end",
-        timeout=20.0,                     # increased — telephony hangup can be slow
+        timeout=20.0,
     )
     if result.get("error"):
         logger.error(f"[END_CALL] Failed: {result}")
     else:
-        logger.info(f"[END_CALL] Call {call_log_id} marked COMPLETED")
+        logger.info(
+            f"[END_CALL] Call {call_log_id} marked COMPLETED — "
+            f"duration: {result.get('durationSeconds', '?')}s"
+        )
 
 
 async def generate_summary_via_groq(transcript_text: str) -> str:
@@ -171,7 +175,7 @@ async def generate_summary_via_groq(transcript_text: str) -> str:
                     ],
                     "max_tokens": 200,
                 },
-                timeout=30.0,                 # increased
+                timeout=30.0,
             )
             summary = r.json()["choices"][0]["message"]["content"]
             logger.info(f"[SUMMARY_GEN] Generated: {summary}")
@@ -182,7 +186,7 @@ async def generate_summary_via_groq(transcript_text: str) -> str:
 
 
 # =============================================================================
-#  PROVIDER BUILDERS (unchanged)
+#  PROVIDER BUILDERS
 # =============================================================================
 
 SARVAM_VOICES = {"anushka", "manisha", "vidya", "arya", "abhilash", "karun", "hitesh"}
@@ -233,17 +237,23 @@ def _build_llm(config_provider: str = None, config_model: str = None):
 
 
 def _build_stt(stt_language: str = None):
+    """
+    FIX: Use config.STT_MODEL (nova-2) instead of hardcoded nova-3.
+    nova-3 is not a valid Deepgram model name and silently falls back,
+    causing poor transcription quality.
+    """
     language = stt_language or os.getenv("DEEPGRAM_LANGUAGE", config.STT_LANGUAGE)
-    logger.info(f"[STT] Deepgram whisper-large — language: {language}")
+    model = os.getenv("DEEPGRAM_MODEL", config.STT_MODEL)  # nova-2 from config
+    logger.info(f"[STT] Deepgram {model} — language: {language}")
     return deepgram.STT(
-        model="nova-3",
+        model=model,
         language=language,
         smart_format=True,
     )
 
 
 # =============================================================================
-#  SEGMENT STREAMER (unchanged)
+#  SEGMENT STREAMER
 # =============================================================================
 
 class SegmentStreamer:
@@ -315,7 +325,7 @@ class AssistantTools(llm.ToolContext):
         )
 
     # ------------------------------------------------------------------
-    #  TRANSFER CALL (unchanged)
+    #  TRANSFER CALL
     # ------------------------------------------------------------------
     @llm.function_tool(description="Transfer the call to a human staff member or receptionist.")
     async def transfer_call(
@@ -324,7 +334,6 @@ class AssistantTools(llm.ToolContext):
             description="Reason the caller needs to be transferred"
         )] = "User requested transfer",
     ):
-        # ... (exactly same as original) ...
         participant_identity = None
         for p in self.ctx.room.remote_participants.values():
             if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
@@ -352,7 +361,7 @@ class AssistantTools(llm.ToolContext):
             return "I encountered an error during transfer. Please stay on the line."
 
     # ------------------------------------------------------------------
-    #  GET STAFF (unchanged)
+    #  GET STAFF
     # ------------------------------------------------------------------
     @llm.function_tool(description=(
         "Get the list of available staff or service providers for this business. "
@@ -364,7 +373,6 @@ class AssistantTools(llm.ToolContext):
             description="Pass empty string."
         )] = "",
     ):
-        # ... (same as original) ...
         if not self.booking_enabled:
             return "Booking is not enabled for this business."
 
@@ -384,7 +392,7 @@ class AssistantTools(llm.ToolContext):
         return "Available staff: " + ", ".join(staff[:-1]) + " and " + staff[-1] + "."
 
     # ------------------------------------------------------------------
-    #  CHECK AVAILABILITY (unchanged)
+    #  CHECK AVAILABILITY
     # ------------------------------------------------------------------
     @llm.function_tool(description=(
         "Check available appointment slots for a given date. "
@@ -399,7 +407,6 @@ class AssistantTools(llm.ToolContext):
             description="Staff member name, or 'Any' if caller has no preference."
         )] = "Any",
     ):
-        # ... (same as original) ...
         if not self.booking_enabled:
             return "Online booking is not available. Please call during working hours."
 
@@ -427,8 +434,7 @@ class AssistantTools(llm.ToolContext):
         return f"Available on {date}: {', '.join(shown)}{more}. Which time works for you?"
 
     # ------------------------------------------------------------------
-    #  BOOK APPOINTMENT — ENFORCED DETAIL COLLECTION
-    #  Detects when booking API is called without required details → forces asking user
+    #  BOOK APPOINTMENT
     # ------------------------------------------------------------------
     @llm.function_tool(description=(
         "Book an appointment AFTER the caller has confirmed their name, date, time, and staff. "
@@ -459,10 +465,11 @@ class AssistantTools(llm.ToolContext):
             f"date={preferred_date}, time={preferred_time}, staff={staff_name}"
         )
 
-        # === ENFORCEMENT: Detect incomplete details and ask user ===
-        if not customer_name or len(str(customer_name).strip()) < 3 or str(customer_name).lower().strip() in ["", "unknown", "the customer", "caller", "guest"]:
-            logger.warning(f"[TOOL:book_appointment] Missing/invalid customer name → forcing user to provide it")
-            return "To book the appointment I need your full name first. Could you please tell me your complete name?"
+        # Enforce: must have a real customer name
+        if not customer_name or len(str(customer_name).strip()) < 2 or \
+                str(customer_name).lower().strip() in {"", "unknown", "the customer", "caller", "guest"}:
+            logger.warning(f"[TOOL:book_appointment] Missing/invalid customer name — asking user")
+            return "To book the appointment I need your full name. Could you please tell me your name?"
 
         if not self.booking_enabled:
             return "Online booking is not available. Please call during working hours."
@@ -481,7 +488,7 @@ class AssistantTools(llm.ToolContext):
         result = await _call_backend(
             "POST", "/calendar/book",
             json=payload,
-            timeout=20.0,                     # increased
+            timeout=20.0,
         )
 
         logger.info(f"[TOOL:book_appointment] Result: {result}")
@@ -510,7 +517,7 @@ class AssistantTools(llm.ToolContext):
 
 
 # =============================================================================
-#  MAIN ENTRYPOINT — STRONGER BOOKING RULES + ROBUST CLEANUP
+#  MAIN ENTRYPOINT
 # =============================================================================
 
 async def entrypoint(ctx: JobContext):
@@ -546,7 +553,7 @@ async def entrypoint(ctx: JobContext):
     booking_enabled = tenant.get("bookingEnabled", False)
     faqs            = tenant.get("faqs", [])
 
-    # === STRONG BOOKING RULES IN SYSTEM PROMPT (prevents premature booking) ===
+    # Append strict booking rules to system prompt
     BOOKING_RULES = """
 BOOKING RULES — FOLLOW STRICTLY:
 1. Never call book_appointment unless the caller has explicitly given their FULL name.
@@ -557,7 +564,7 @@ BOOKING RULES — FOLLOW STRICTLY:
     system_prompt += BOOKING_RULES
     logger.info("[ENTRYPOINT] Added strict booking rules to system prompt")
 
-    # Inject FAQs (unchanged)
+    # Inject FAQs into system prompt
     if faqs:
         faq_lines = "\n".join([
             f"Q: {f.get('question', '')}\nA: {f.get('answer', '')}"
@@ -587,6 +594,7 @@ BOOKING RULES — FOLLOW STRICTLY:
         def on_agent_speech(event):
             asyncio.create_task(streamer.push("agent", event.transcript))
 
+    # FIX: RoomInputOptions is deprecated — use room_options with RoomOptions
     await session.start(
         room=ctx.room,
         agent=Agent(
@@ -608,7 +616,7 @@ BOOKING RULES — FOLLOW STRICTLY:
     if streamer:
         await streamer.close()
 
-    # === ROBUST CLEANUP — catch any final errors so agent doesn't crash ===
+    # CLEANUP — generate summary then end call
     if call_log_id and streamer:
         transcript_text = streamer.get_full_transcript()
         if transcript_text.strip():
